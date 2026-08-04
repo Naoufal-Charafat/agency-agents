@@ -10,7 +10,7 @@
 #   ./scripts/convert.sh [--tool <name>] [--out <dir>] [--parallel] [--jobs N] [--help]
 #
 # Tools:
-#   antigravity  — Antigravity skill files (~/.gemini/antigravity/skills/)
+#   antigravity  — Antigravity skill files (~/.gemini/config/skills/)
 #   gemini-cli   — Gemini CLI subagent files (~/.gemini/agents/*.md)
 #   opencode     — OpenCode agent files (.opencode/agents/*.md)
 #   cursor       — Cursor rule files (.cursor/rules/*.mdc)
@@ -18,8 +18,12 @@
 #   windsurf     — Single .windsurfrules for Windsurf
 #   openclaw     — OpenClaw workspaces (integrations/openclaw/<agent>/SOUL.md)
 #   qwen         — Qwen Code SubAgent files (~/.qwen/agents/*.md)
+#   zcode        — ZCode agent files (.zcode/agents/*.md · ~/.config/zcode/agents/*.md)
 #   kimi         — Kimi Code CLI agent files (~/.config/kimi/agents/)
 #   codex        — Codex custom agent TOML files (~/.codex/agents/*.toml)
+#   osaurus      — Osaurus skill files (~/.osaurus/skills/<name>/SKILL.md)
+#   hermes       — Hermes lazy-router plugin (one plugin + on-disk agent index)
+#   vibe         — Mistral Vibe agent TOML + prompt files (~/.vibe/agents/*.toml + ~/.vibe/prompts/*.md)
 #   all          — All tools (default)
 #
 # Output is written to integrations/<tool>/ relative to the repo root.
@@ -67,13 +71,13 @@ TODAY="$(date +%Y-%m-%d)"
 . "$SCRIPT_DIR/lib.sh"
 
 AGENT_DIRS=(
-  academic design engineering finance game-development gis integrations marketing paid-media product project-management
-  sales security spatial-computing specialized strategy support testing
+  academic design engineering finance game-development gis healthcare marketing paid-media product project-management
+  sales security spatial-computing specialized support testing
 )
 
 # --- Usage ---
 usage() {
-  sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -117,14 +121,41 @@ convert_antigravity() {
   outfile="$outdir/SKILL.md"
   mkdir -p "$outdir"
 
-  # Antigravity SKILL.md format mirrors community skills in ~/.gemini/antigravity/skills/
+  # Antigravity Agent-Skills SKILL.md — name + description frontmatter and the
+  # persona as the body, installed into ~/.gemini/config/skills/ (global) or
+  # <project>/.agents/skills/ (project). Standard fields only, so it stays a
+  # valid Agent-Skills skill for any host (and deterministic — no date stamp).
   cat > "$outfile" <<HEREDOC
 ---
 name: ${slug}
 description: ${description}
-risk: low
-source: community
-date_added: '${TODAY}'
+---
+${body}
+HEREDOC
+}
+
+convert_osaurus() {
+  local file="$1"
+  local name description slug outdir outfile body
+
+  name="$(get_field "name" "$file")"
+  description="$(get_field "description" "$file")"
+  slug="agency-$(slugify "$name")"
+  body="$(get_body "$file")"
+
+  # Stage one dir per skill (install.sh copies into ~/.osaurus/skills/<name>/).
+  outdir="$OUT_DIR/osaurus/$slug"
+  outfile="$outdir/SKILL.md"
+  mkdir -p "$outdir"
+
+  # Osaurus skill format: the Anthropic "Agent Skills" SKILL.md — a directory
+  # named for the skill containing a SKILL.md with name + description frontmatter
+  # and the persona as the instruction body. Installs into ~/.osaurus/skills/.
+  # Kept to the standard fields so it stays compatible with any Agent-Skills host.
+  cat > "$outfile" <<HEREDOC
+---
+name: ${slug}
+description: ${description}
 ---
 ${body}
 HEREDOC
@@ -395,6 +426,43 @@ HEREDOC
   fi
 }
 
+convert_zcode() {
+  local file="$1"
+  local name description tools slug outfile body
+
+  name="$(get_field "name" "$file")"
+  description="$(get_field "description" "$file")"
+  tools="$(get_field "tools" "$file")"
+  slug="$(slugify "$name")"
+  body="$(get_body "$file")"
+
+  outfile="$OUT_DIR/zcode/agents/${slug}.md"
+  mkdir -p "$(dirname "$outfile")"
+
+  # ZCode agent format (Z.ai GLM harness): .md with YAML frontmatter in
+  # .zcode/agents/ (project) or ~/.config/zcode/agents/ (global). name and
+  # description required; tools optional (only if present in source). Byte-
+  # identical to the qwen-md shape, which the Agency Agents app renders natively.
+  if [[ -n "$tools" ]]; then
+    cat > "$outfile" <<HEREDOC
+---
+name: ${slug}
+description: ${description}
+tools: ${tools}
+---
+${body}
+HEREDOC
+  else
+    cat > "$outfile" <<HEREDOC
+---
+name: ${slug}
+description: ${description}
+---
+${body}
+HEREDOC
+  fi
+}
+
 convert_kimi() {
   local file="$1"
   local name description slug outdir agent_file body
@@ -420,6 +488,40 @@ HEREDOC
 
   # Write system prompt to separate file
   cat > "$outdir/system.md" <<HEREDOC
+# ${name}
+
+${description}
+
+${body}
+HEREDOC
+}
+
+convert_vibe() {
+  local file="$1"
+  local name description slug outdir agent_file prompt_file body
+
+  name="$(get_field "name" "$file")"
+  description="$(get_field "description" "$file")"
+  slug="$(slugify "$name")"
+  body="$(get_body "$file")"
+
+  # Mistral Vibe uses two files per agent:
+  # 1. A TOML configuration file in ~/.vibe/agents/<slug>.toml
+  # 2. A markdown prompt file in ~/.vibe/prompts/<slug>.md
+
+  outdir="$OUT_DIR/vibe"
+  agent_file="$outdir/agents/${slug}.toml"
+  prompt_file="$outdir/prompts/${slug}.md"
+  mkdir -p "$outdir/agents" "$outdir/prompts"
+
+  # Write the TOML agent configuration
+  cat > "$agent_file" <<HEREDOC
+agent_type = "agent"
+system_prompt_id = "${slug}"
+HEREDOC
+
+  # Write the markdown prompt file
+  cat > "$prompt_file" <<HEREDOC
 # ${name}
 
 ${description}
@@ -500,9 +602,27 @@ HEREDOC
 
 # --- Main loop ---
 
+# Remove a tool's previously-generated output before regenerating, so renamed or
+# deleted agents don't leave orphan files behind (convert.sh overwrites in place
+# but never pruned stale output). Preserves the committed README.md — the only
+# tracked file under integrations/<tool>/ for conversion targets.
+clean_tool_output() {
+  local dir="$OUT_DIR/$1"
+  [[ -d "$dir" ]] || return 0
+  find "$dir" -mindepth 1 -maxdepth 1 ! -name 'README.md' -exec rm -rf {} +
+}
+
 run_conversions() {
   local tool="$1"
   local count=0
+
+  if [[ "$tool" == "hermes" ]]; then
+    clean_tool_output "$tool"
+    python3 "$SCRIPT_DIR/build-hermes-plugin.py" --repo-root "$REPO_ROOT" --out "$OUT_DIR/hermes"
+    return
+  fi
+
+  clean_tool_output "$tool"
 
   for dir in "${AGENT_DIRS[@]}"; do
     local dirpath="$REPO_ROOT/$dir"
@@ -526,7 +646,10 @@ run_conversions() {
         cursor)      convert_cursor      "$file" ;;
         openclaw)    convert_openclaw    "$file" ;;
         qwen)        convert_qwen        "$file" ;;
+        zcode)       convert_zcode       "$file" ;;
         kimi)        convert_kimi        "$file" ;;
+        osaurus)     convert_osaurus     "$file" ;;
+        vibe)        convert_vibe        "$file" ;;
         aider)       accumulate_aider    "$file" ;;
         windsurf)    accumulate_windsurf "$file" ;;
       esac
@@ -557,7 +680,7 @@ main() {
     esac
   done
 
-  local valid_tools=("antigravity" "gemini-cli" "opencode" "cursor" "aider" "windsurf" "openclaw" "qwen" "kimi" "codex" "all")
+  local valid_tools=("antigravity" "gemini-cli" "opencode" "cursor" "aider" "windsurf" "openclaw" "qwen" "zcode" "kimi" "codex" "osaurus" "hermes" "vibe" "all")
   local valid=false
   for t in "${valid_tools[@]}"; do [[ "$t" == "$tool" ]] && valid=true && break; done
   if ! $valid; then
@@ -576,7 +699,7 @@ main() {
 
   local tools_to_run=()
   if [[ "$tool" == "all" ]]; then
-    tools_to_run=("antigravity" "gemini-cli" "opencode" "cursor" "aider" "windsurf" "openclaw" "qwen" "kimi" "codex")
+    tools_to_run=("antigravity" "gemini-cli" "opencode" "cursor" "aider" "windsurf" "openclaw" "qwen" "zcode" "kimi" "codex" "osaurus" "hermes" "vibe")
   else
     tools_to_run=("$tool")
   fi
@@ -587,7 +710,7 @@ main() {
 
   if $use_parallel && [[ "$tool" == "all" ]]; then
     # Tools that write to separate dirs can run in parallel; buffer output so each tool's output stays together
-    local parallel_tools=(antigravity gemini-cli opencode cursor openclaw qwen codex)
+    local parallel_tools=(antigravity gemini-cli opencode cursor openclaw qwen zcode codex osaurus hermes vibe)
     local parallel_out_dir
     parallel_out_dir="$(mktemp -d)"
     info "Converting: ${#parallel_tools[@]}/${n_tools} tools in parallel (output buffered per tool)..."
